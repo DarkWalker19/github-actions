@@ -1,0 +1,56 @@
+name: Discord DM notify
+description: Send a Discord DM with the outcome of the current job. The bot token and DM channel ID come from environment variables or files.
+
+inputs:
+  status:
+    description: Job status to report; pass `job.status`
+    required: true
+  bot-token-file:
+    description: File holding the Discord bot token, used when DISCORD_BOT_TOKEN is not set
+    default: /run/secrets/discord_bot_token
+  channel-id-file:
+    description: File holding the DM channel ID, used when DISCORD_DM_CHANNEL_ID is not set
+    default: /run/secrets/discord_dm_channel_id
+
+runs:
+  using: composite
+  steps:
+    - name: Send Discord DM
+      shell: bash
+      env:
+        STATUS: ${{ inputs.status }}
+        BOT_TOKEN_FILE: ${{ inputs.bot-token-file }}
+        CHANNEL_ID_FILE: ${{ inputs.channel-id-file }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        # Environment variable wins; otherwise read the file
+        read_value() {
+          if [ -n "${!1:-}" ]; then printf '%s' "${!1}"
+          elif [ -r "$2" ]; then tr -d '\r\n' < "$2"
+          fi
+        }
+        BOT_TOKEN="$(read_value DISCORD_BOT_TOKEN "$BOT_TOKEN_FILE")"
+        CHANNEL_ID="$(read_value DISCORD_DM_CHANNEL_ID "$CHANNEL_ID_FILE")"
+        if [ -z "$BOT_TOKEN" ] || [ -z "$CHANNEL_ID" ]; then
+          echo "::warning::Discord notification skipped: set DISCORD_BOT_TOKEN/DISCORD_DM_CHANNEL_ID or provide $BOT_TOKEN_FILE/$CHANNEL_ID_FILE"
+          exit 0
+        fi
+        case "$STATUS" in
+          success) color=3066993;  icon="✅" ;;
+          failure) color=15158332; icon="❌" ;;
+          *)       color=9807270;  icon="⚪" ;;
+        esac
+        payload=$(jq -n \
+          --arg title "$icon $GITHUB_REPOSITORY — $GITHUB_WORKFLOW: $STATUS" \
+          --arg url "$RUN_URL" --argjson color "$color" \
+          --arg desc "Ref \`$GITHUB_REF_NAME\` @ \`${GITHUB_SHA::7}\` by $GITHUB_ACTOR" \
+          '{embeds:[{title:$title,url:$url,color:$color,description:$desc}]}')
+        # Never let a failed notification fail the workflow, but surface Discord's error body
+        resp="$(mktemp)"
+        code=$(curl -sS -o "$resp" -w '%{http_code}' -X POST "https://discord.com/api/v10/channels/$CHANNEL_ID/messages" \
+          -H "Authorization: Bot $BOT_TOKEN" -H "Content-Type: application/json" \
+          -d "$payload") || code=000
+        if [ "${code:0:1}" != 2 ]; then
+          echo "::warning::Discord notification failed (HTTP $code): $(cat "$resp")"
+        fi
+        rm -f "$resp"
